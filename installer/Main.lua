@@ -16,11 +16,14 @@ local sidebarW = 20
 
 local state = {
     page = 1,
+    mode = nil, -- "router", "provider", "update"
     role = nil,
     libraries = {},
+    selectedLibs = {}, -- для режима обновления
     installing = false,
     installLog = {},
-    installProgress = 0
+    installProgress = 0,
+    scrollOffset = 0 -- для прокрутки списка библиотек
 }
 
 local libraryConfig = {
@@ -29,47 +32,53 @@ local libraryConfig = {
         file = "OCNP.lua", 
         path = "/lib/",
         url = "https://raw.githubusercontent.com/KilDoomWise/OCNP/refs/heads/main/src/OCNP.lua",
-        required = {"router", "provider"}
+        required = {"router", "provider"},
+        description = "Сетевой протокол OCN"
     },
     {
         id = "utils", 
         file = "utils.lua", 
         path = "/lib/",
         url = "https://raw.githubusercontent.com/KilDoomWise/OCN/refs/heads/main/lib/utils.lua",
-        required = {"router", "provider"}
+        required = {"router", "provider"},
+        description = "Вспомогательные функции"
     },
     {
         id = "bgp", 
         file = "bgp.lua", 
         path = "/lib/",
         url = "https://raw.githubusercontent.com/KilDoomWise/OCN/refs/heads/main/lib/bgp.lua",
-        required = {"provider"}
+        required = {"provider"},
+        description = "Протокол маршрутизации BGP"
     },
     {
         id = "dhcp", 
         file = "dhcp.lua", 
         path = "/lib/",
         url = "https://raw.githubusercontent.com/KilDoomWise/OCN/refs/heads/main/lib/dhcp.lua",
-        required = {"router", "provider"}
+        required = {"router", "provider"},
+        description = "DHCP сервер/клиент"
     },
     {
         id = "router_bin", 
         file = "router.lua", 
         path = "/bin/",
         url = "https://raw.githubusercontent.com/KilDoomWise/OCN/refs/heads/main/bin/router.lua",
-        required = {"router"}
+        required = {"router"},
+        description = "Программа роутера"
     },
     {
         id = "isp_bin", 
         file = "isp.lua", 
         path = "/bin/",
         url = "https://raw.githubusercontent.com/KilDoomWise/OCN/refs/heads/main/bin/isp.lua",
-        required = {"provider"}
+        required = {"provider"},
+        description = "Программа провайдера"
     }
 }
 
 local steps = {
-    {id = 1, name = "Роль"},
+    {id = 1, name = "Режим"},
     {id = 2, name = "Файлы"},
     {id = 3, name = "Сводка"},
     {id = 4, name = "Установка"}
@@ -90,7 +99,9 @@ local colors = {
     cardBg = 0x1a1a1a,
     cardSelected = 0x2d2d2d,
     progressFill = 0xffffff,
-    progressEmpty = 0x333333
+    progressEmpty = 0x333333,
+    checkbox = 0x00aa00,
+    checkboxEmpty = 0x555555
 }
 
 local function fill(x, y, w, h, bg, char)
@@ -144,6 +155,18 @@ local function drawCard(x, y, w, h, title, desc, selected)
     text(x + 3, y + 2, colors.textDim, bg, desc)
 end
 
+local function drawCheckbox(x, y, checked, label, exists)
+    local boxChar = checked and "[×]" or "[ ]"
+    local boxColor = checked and colors.checkbox or colors.checkboxEmpty
+    
+    text(x, y, boxColor, colors.windowBg, boxChar)
+    text(x + 4, y, colors.text, colors.windowBg, label)
+    
+    if exists then
+        text(x + 4 + unicode.len(label) + 1, y, colors.textDim, colors.windowBg, "(установлен)")
+    end
+end
+
 local function drawProgressBar(x, y, w, progress)
     local filledW = math.floor(w * progress)
     
@@ -171,10 +194,14 @@ local function checkLibraries()
         local exists = filesystem.exists(fullPath)
         
         local needed = false
-        for _, role in ipairs(lib.required) do
-            if role == state.role then
-                needed = true
-                break
+        if state.mode == "update" then
+            needed = true
+        else
+            for _, role in ipairs(lib.required) do
+                if role == state.role then
+                    needed = true
+                    break
+                end
             end
         end
         
@@ -184,10 +211,38 @@ local function checkLibraries()
                 path = lib.path,
                 url = lib.url,
                 exists = exists,
+                description = lib.description,
                 status = exists and "update" or "install"
             }
         end
     end
+end
+
+local function checkAllLibraries()
+    state.libraries = {}
+    state.selectedLibs = {}
+    for _, lib in ipairs(libraryConfig) do
+        local fullPath = lib.path .. lib.file
+        local exists = filesystem.exists(fullPath)
+        
+        state.libraries[lib.id] = {
+            file = lib.file,
+            path = lib.path,
+            url = lib.url,
+            exists = exists,
+            description = lib.description,
+            status = exists and "update" or "install"
+        }
+        state.selectedLibs[lib.id] = false
+    end
+end
+
+local function getSelectedCount()
+    local count = 0
+    for _, selected in pairs(state.selectedLibs) do
+        if selected then count = count + 1 end
+    end
+    return count
 end
 
 local function drawWindow()
@@ -242,19 +297,24 @@ local function drawPage1()
     local cx, cy, cw, ch = drawWindow()
     buttons = {}
     
-    text(cx, cy, colors.text, colors.windowBg, "Выберите назначение")
-    text(cx, cy + 1, colors.textDim, colors.windowBg, "Для чего будет использоваться этот компьютер?")
+    text(cx, cy, colors.text, colors.windowBg, "Выберите режим")
+    text(cx, cy + 1, colors.textDim, colors.windowBg, "Что вы хотите сделать?")
     
     local cardH = 4
     local cardY = cy + 4
-    drawCard(cx, cardY, cw, cardH, "Роутер", "Организует работу локальной сети", state.role == "router")
+    
+    drawCard(cx, cardY, cw, cardH, "Роутер", "Установить компоненты роутера", state.mode == "router")
     table.insert(buttons, {x = cx, y = cardY, w = cw, h = cardH, action = "router"})
     
     cardY = cardY + cardH + 1
-    drawCard(cx, cardY, cw, cardH, "Провайдер", "Связывает сети, работает с пирингами", state.role == "provider")
+    drawCard(cx, cardY, cw, cardH, "Провайдер", "Установить компоненты провайдера", state.mode == "provider")
     table.insert(buttons, {x = cx, y = cardY, w = cw, h = cardH, action = "provider"})
     
-    if state.role then
+    cardY = cardY + cardH + 1
+    drawCard(cx, cardY, cw, cardH, "Обновление", "Выбрать библиотеки вручную", state.mode == "update")
+    table.insert(buttons, {x = cx, y = cardY, w = cw, h = cardH, action = "update"})
+    
+    if state.mode then
         local label = "Далее"
         local btnW = getButtonWidth(label)
         local btn = drawButton(cx + cw - btnW, getButtonY(cy, ch), label, colors.buttonBg, colors.text)
@@ -267,72 +327,131 @@ local function drawPage2()
     local cx, cy, cw, ch = drawWindow()
     buttons = {}
     
-    local roleName = state.role == "router" and "роутера" or "провайдера"
-    text(cx, cy, colors.text, colors.windowBg, "Файлы")
-    text(cx, cy + 1, colors.textDim, colors.windowBg, "Будут установлены для " .. roleName)
-    
-    local treeY = cy + 4
-    
-    local libFiles = {}
-    local binFiles = {}
-    
-    for id, info in pairs(state.libraries) do
-        if info.path == "/lib/" then
-            table.insert(libFiles, {id = id, info = info})
-        else
-            table.insert(binFiles, {id = id, info = info})
+    if state.mode == "update" then
+        text(cx, cy, colors.text, colors.windowBg, "Выберите библиотеки")
+        text(cx, cy + 1, colors.textDim, colors.windowBg, "Отметьте файлы для установки/обновления")
+        
+        local listY = cy + 4
+        local libList = {}
+        
+        for id, info in pairs(state.libraries) do
+            table.insert(libList, {id = id, info = info})
         end
-    end
-    
-    table.sort(libFiles, function(a, b) return a.info.file < b.info.file end)
-    table.sort(binFiles, function(a, b) return a.info.file < b.info.file end)
-    
-    text(cx, treeY, colors.textMid, colors.windowBg, "/lib")
-    treeY = treeY + 1
-    
-    for i, lib in ipairs(libFiles) do
-        local isLast = i == #libFiles
-        local prefix = isLast and "  └ " or "  ├ "
-        local statusIcon = lib.info.exists and "~" or "+"
-        local statusColor = lib.info.exists and colors.textMid or colors.success
-        local statusText = lib.info.exists and " обновить" or " новый"
+        table.sort(libList, function(a, b) 
+            if a.info.path ~= b.info.path then
+                return a.info.path < b.info.path
+            end
+            return a.info.file < b.info.file 
+        end)
         
-        text(cx, treeY, colors.textDim, colors.windowBg, prefix)
-        text(cx + unicode.len(prefix), treeY, statusColor, colors.windowBg, statusIcon)
-        text(cx + unicode.len(prefix) + 2, treeY, colors.text, colors.windowBg, lib.info.file)
-        text(cx + unicode.len(prefix) + 2 + unicode.len(lib.info.file), treeY, colors.textDim, colors.windowBg, statusText)
+        local currentPath = nil
+        local itemIndex = 0
+        
+        for _, lib in ipairs(libList) do
+            if lib.info.path ~= currentPath then
+                currentPath = lib.info.path
+                text(cx, listY, colors.textMid, colors.windowBg, currentPath)
+                listY = listY + 1
+            end
+            
+            local y = listY
+            drawCheckbox(cx + 2, y, state.selectedLibs[lib.id], lib.info.file, lib.info.exists)
+            
+            table.insert(buttons, {
+                x = cx + 2, 
+                y = y, 
+                w = cw - 4, 
+                h = 1, 
+                action = "toggle_" .. lib.id
+            })
+            
+            listY = listY + 1
+            itemIndex = itemIndex + 1
+        end
+        
+        -- Кнопки выбрать всё / снять всё
+        local selectAllY = listY + 1
+        text(cx, selectAllY, colors.textDim, colors.windowBg, "[Выбрать всё]")
+        table.insert(buttons, {x = cx, y = selectAllY, w = 14, h = 1, action = "select_all"})
+        
+        text(cx + 16, selectAllY, colors.textDim, colors.windowBg, "[Снять всё]")
+        table.insert(buttons, {x = cx + 16, y = selectAllY, w = 12, h = 1, action = "deselect_all"})
+        
+    else
+        local roleName = state.role == "router" and "роутера" or "провайдера"
+        text(cx, cy, colors.text, colors.windowBg, "Файлы")
+        text(cx, cy + 1, colors.textDim, colors.windowBg, "Будут установлены для " .. roleName)
+        
+        local treeY = cy + 4
+        
+        local libFiles = {}
+        local binFiles = {}
+        
+        for id, info in pairs(state.libraries) do
+            if info.path == "/lib/" then
+                table.insert(libFiles, {id = id, info = info})
+            else
+                table.insert(binFiles, {id = id, info = info})
+            end
+        end
+        
+        table.sort(libFiles, function(a, b) return a.info.file < b.info.file end)
+        table.sort(binFiles, function(a, b) return a.info.file < b.info.file end)
+        
+        text(cx, treeY, colors.textMid, colors.windowBg, "/lib")
+        treeY = treeY + 1
+        
+        for i, lib in ipairs(libFiles) do
+            local isLast = i == #libFiles
+            local prefix = isLast and "  └ " or "  ├ "
+            local statusIcon = lib.info.exists and "~" or "+"
+            local statusColor = lib.info.exists and colors.textMid or colors.success
+            local statusText = lib.info.exists and " обновить" or " новый"
+            
+            text(cx, treeY, colors.textDim, colors.windowBg, prefix)
+            text(cx + unicode.len(prefix), treeY, statusColor, colors.windowBg, statusIcon)
+            text(cx + unicode.len(prefix) + 2, treeY, colors.text, colors.windowBg, lib.info.file)
+            text(cx + unicode.len(prefix) + 2 + unicode.len(lib.info.file), treeY, colors.textDim, colors.windowBg, statusText)
+            
+            treeY = treeY + 1
+        end
         
         treeY = treeY + 1
-    end
-    
-    treeY = treeY + 1
-    text(cx, treeY, colors.textMid, colors.windowBg, "/bin")
-    treeY = treeY + 1
-    
-    for i, lib in ipairs(binFiles) do
-        local isLast = i == #binFiles
-        local prefix = isLast and "  └ " or "  ├ "
-        local statusIcon = lib.info.exists and "~" or "+"
-        local statusColor = lib.info.exists and colors.textMid or colors.success
-        local statusText = lib.info.exists and " обновить" or " новый"
-        
-        text(cx, treeY, colors.textDim, colors.windowBg, prefix)
-        text(cx + unicode.len(prefix), treeY, statusColor, colors.windowBg, statusIcon)
-        text(cx + unicode.len(prefix) + 2, treeY, colors.text, colors.windowBg, lib.info.file)
-        text(cx + unicode.len(prefix) + 2 + unicode.len(lib.info.file), treeY, colors.textDim, colors.windowBg, statusText)
-        
+        text(cx, treeY, colors.textMid, colors.windowBg, "/bin")
         treeY = treeY + 1
+        
+        for i, lib in ipairs(binFiles) do
+            local isLast = i == #binFiles
+            local prefix = isLast and "  └ " or "  ├ "
+            local statusIcon = lib.info.exists and "~" or "+"
+            local statusColor = lib.info.exists and colors.textMid or colors.success
+            local statusText = lib.info.exists and " обновить" or " новый"
+            
+            text(cx, treeY, colors.textDim, colors.windowBg, prefix)
+            text(cx + unicode.len(prefix), treeY, statusColor, colors.windowBg, statusIcon)
+            text(cx + unicode.len(prefix) + 2, treeY, colors.text, colors.windowBg, lib.info.file)
+            text(cx + unicode.len(prefix) + 2 + unicode.len(lib.info.file), treeY, colors.textDim, colors.windowBg, statusText)
+            
+            treeY = treeY + 1
+        end
     end
     
     local btn = drawButton(cx, getButtonY(cy, ch), "Назад", colors.buttonBg, colors.text)
     btn.action = "back"
     table.insert(buttons, btn)
     
-    local label = "Далее"
-    local btnW = getButtonWidth(label)
-    btn = drawButton(cx + cw - btnW, getButtonY(cy, ch), label, colors.buttonBg, colors.text)
-    btn.action = "next"
-    table.insert(buttons, btn)
+    local canProceed = true
+    if state.mode == "update" then
+        canProceed = getSelectedCount() > 0
+    end
+    
+    if canProceed then
+        local label = "Далее"
+        local btnW = getButtonWidth(label)
+        btn = drawButton(cx + cw - btnW, getButtonY(cy, ch), label, colors.buttonBg, colors.text)
+        btn.action = "next"
+        table.insert(buttons, btn)
+    end
 end
 
 local function drawPage3()
@@ -344,34 +463,60 @@ local function drawPage3()
     
     local y = cy + 4
     
-    local roleName = state.role == "router" and "Роутер" or "Провайдер"
+    local modeName
+    if state.mode == "router" then
+        modeName = "Роутер"
+    elseif state.mode == "provider" then
+        modeName = "Провайдер"
+    else
+        modeName = "Обновление"
+    end
+    
     text(cx, y, colors.textDim, colors.windowBg, "Режим")
-    text(cx + 12, y, colors.text, colors.windowBg, roleName)
+    text(cx + 12, y, colors.text, colors.windowBg, modeName)
     y = y + 2
     
     local libNames = {}
     local binNames = {}
-    for id, info in pairs(state.libraries) do 
-        if info.path == "/lib/" then
-            table.insert(libNames, info.file)
-        else
-            table.insert(binNames, info.file)
+    
+    if state.mode == "update" then
+        for id, selected in pairs(state.selectedLibs) do
+            if selected then
+                local info = state.libraries[id]
+                if info.path == "/lib/" then
+                    table.insert(libNames, info.file)
+                else
+                    table.insert(binNames, info.file)
+                end
+            end
+        end
+    else
+        for id, info in pairs(state.libraries) do 
+            if info.path == "/lib/" then
+                table.insert(libNames, info.file)
+            else
+                table.insert(binNames, info.file)
+            end
         end
     end
     
-    text(cx, y, colors.textDim, colors.windowBg, "/lib")
-    y = y + 1
-    for _, name in ipairs(libNames) do
-        text(cx + 2, y, colors.textMid, colors.windowBg, name)
+    if #libNames > 0 then
+        text(cx, y, colors.textDim, colors.windowBg, "/lib")
+        y = y + 1
+        for _, name in ipairs(libNames) do
+            text(cx + 2, y, colors.textMid, colors.windowBg, name)
+            y = y + 1
+        end
         y = y + 1
     end
     
-    y = y + 1
-    text(cx, y, colors.textDim, colors.windowBg, "/bin")
-    y = y + 1
-    for _, name in ipairs(binNames) do
-        text(cx + 2, y, colors.textMid, colors.windowBg, name)
+    if #binNames > 0 then
+        text(cx, y, colors.textDim, colors.windowBg, "/bin")
         y = y + 1
+        for _, name in ipairs(binNames) do
+            text(cx + 2, y, colors.textMid, colors.windowBg, name)
+            y = y + 1
+        end
     end
     
     local btn = drawButton(cx, getButtonY(cy, ch), "Назад", colors.buttonBg, colors.text)
@@ -470,8 +615,18 @@ local function doInstall()
     end
     
     local toInstall = {}
-    for id, info in pairs(state.libraries) do
-        table.insert(toInstall, {id = id, file = info.file, path = info.path, url = info.url})
+    
+    if state.mode == "update" then
+        for id, selected in pairs(state.selectedLibs) do
+            if selected then
+                local info = state.libraries[id]
+                table.insert(toInstall, {id = id, file = info.file, path = info.path, url = info.url})
+            end
+        end
+    else
+        for id, info in pairs(state.libraries) do
+            table.insert(toInstall, {id = id, file = info.file, path = info.path, url = info.url})
+        end
     end
     
     for i, lib in ipairs(toInstall) do
@@ -507,12 +662,19 @@ local function handleClick(mx, my)
     for _, btn in ipairs(buttons) do
         if isInside(mx, my, btn) then
             if btn.action == "router" then
+                state.mode = "router"
                 state.role = "router"
                 checkLibraries()
                 drawPage1()
             elseif btn.action == "provider" then
+                state.mode = "provider"
                 state.role = "provider"
                 checkLibraries()
+                drawPage1()
+            elseif btn.action == "update" then
+                state.mode = "update"
+                state.role = nil
+                checkAllLibraries()
                 drawPage1()
             elseif btn.action == "next" then
                 state.page = state.page + 1
@@ -528,6 +690,20 @@ local function handleClick(mx, my)
                 doInstall()
             elseif btn.action == "exit" then
                 return "exit"
+            elseif btn.action == "select_all" then
+                for id, _ in pairs(state.selectedLibs) do
+                    state.selectedLibs[id] = true
+                end
+                drawPage2()
+            elseif btn.action == "deselect_all" then
+                for id, _ in pairs(state.selectedLibs) do
+                    state.selectedLibs[id] = false
+                end
+                drawPage2()
+            elseif string.sub(btn.action, 1, 7) == "toggle_" then
+                local libId = string.sub(btn.action, 8)
+                state.selectedLibs[libId] = not state.selectedLibs[libId]
+                drawPage2()
             end
             break
         end
