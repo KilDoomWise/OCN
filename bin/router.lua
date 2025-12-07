@@ -4,19 +4,24 @@ local computer = require("computer")
 local filesystem = require("filesystem")
 local term = require("term")
 
--- Убедитесь, что эти библиотеки существуют
 local OCNP = require("ocnp")
 local Utils = require("utils")
 local DHCP = require("dhcp")
 
 local Router = {}
-Router.VERSION = "1.1"
+Router.VERSION = "2.0"
 Router.PORT = 31
 Router.HUB_PORT = 32
 Router.CONFIG_PATH = "/etc/PetusRouter/conf.oc"
 Router.ROUTES_PATH = "/etc/PetusRouter/routes.db"
+Router.NAT_PATH = "/etc/PetusRouter/nat.db"
 Router.CLEANUP_INTERVAL = 100
 Router.SEEN_TTL = 30
+Router.NAT_TIMEOUT = 300  -- 5 минут
+
+-- Диапазон внешних портов для NAT
+Router.NAT_PORT_MIN = 49152
+Router.NAT_PORT_MAX = 65535
 
 Router.HUB = {
   HELLO = "HUB_ROUTER_HELLO",
@@ -24,111 +29,64 @@ Router.HUB = {
   NAK = "HUB_ROUTER_NAK"
 }
 
--- === ЦВЕТНАЯ СИСТЕМА ЛОГИРОВАНИЯ ===
+-- === ЛОГИРОВАНИЕ ===
 local gpu = component.gpu
 local LOG_COLORS = {
-  ERROR = 0xFF0000,    -- Красный
-  WARNING = 0xFFAA00,  -- Оранжевый
-  SUCCESS = 0x00FF00,  -- Зеленый
-  INFO = 0x00AAFF,     -- Голубой
-  DEBUG = 0xAAAAAA,    -- Серый
-  DHCP = 0xFF00FF,     -- Фиолетовый
-  ROUTE = 0xFFFF00,    -- Желтый
-  HUB = 0x00FFFF       -- Циан
+  ERROR = 0xFF0000,
+  WARNING = 0xFFAA00,
+  SUCCESS = 0x00FF00,
+  INFO = 0x00AAFF,
+  DEBUG = 0xAAAAAA,
+  DHCP = 0xFF00FF,
+  ROUTE = 0xFFFF00,
+  HUB = 0x00FFFF,
+  NAT = 0xFF6600
 }
 
 local function colorLog(category, message, color)
   local timestamp = string.format("[%.2f]", computer.uptime())
   local prefix = string.format("[%s]", category)
   
-  -- Сохраняем текущие цвета
-  local oldBg = gpu.getBackground()
   local oldFg = gpu.getForeground()
   
-  -- Timestamp белым
   gpu.setForeground(0xFFFFFF)
   term.write(timestamp .. " ")
   
-  -- Категория цветная
   gpu.setForeground(color)
   term.write(prefix .. " ")
   
-  -- Сообщение белым
   gpu.setForeground(0xFFFFFF)
   print(message)
   
-  -- Восстанавливаем цвета
-  gpu.setBackground(oldBg)
   gpu.setForeground(oldFg)
 end
 
-local function logError(msg)
-  colorLog("ERROR", msg, LOG_COLORS.ERROR)
-end
+local function logError(msg) colorLog("ERROR", msg, LOG_COLORS.ERROR) end
+local function logWarning(msg) colorLog("WARN", msg, LOG_COLORS.WARNING) end
+local function logSuccess(msg) colorLog("OK", msg, LOG_COLORS.SUCCESS) end
+local function logInfo(msg) colorLog("INFO", msg, LOG_COLORS.INFO) end
+local function logDebug(msg) colorLog("DEBUG", msg, LOG_COLORS.DEBUG) end
+local function logDHCP(msg) colorLog("DHCP", msg, LOG_COLORS.DHCP) end
+local function logRoute(msg) colorLog("ROUTE", msg, LOG_COLORS.ROUTE) end
+local function logHub(msg) colorLog("HUB", msg, LOG_COLORS.HUB) end
+local function logNAT(msg) colorLog("NAT", msg, LOG_COLORS.NAT) end
 
-local function logWarning(msg)
-  colorLog("WARN", msg, LOG_COLORS.WARNING)
-end
-
-local function logSuccess(msg)
-  colorLog("OK", msg, LOG_COLORS.SUCCESS)
-end
-
-local function logInfo(msg)
-  colorLog("INFO", msg, LOG_COLORS.INFO)
-end
-
-local function logDebug(msg)
-  colorLog("DEBUG", msg, LOG_COLORS.DEBUG)
-end
-
-local function logDHCP(msg)
-  colorLog("DHCP", msg, LOG_COLORS.DHCP)
-end
-
-local function logRoute(msg)
-  colorLog("ROUTE", msg, LOG_COLORS.ROUTE)
-end
-
-local function logHub(msg)
-  colorLog("HUB", msg, LOG_COLORS.HUB)
-end
-
--- Красивый вывод содержимого пакета
-local function logPacketContent(parsed, incoming)
-  local direction = incoming and "<<< INCOMING >>>" or ">>> OUTGOING >>>"
-  local color = incoming and LOG_COLORS.INFO or LOG_COLORS.DEBUG
-  
-  colorLog("PACKET", direction, color)
-  logDebug(string.format("  Type: %s | SRC: %s | DST: %s", 
-    parsed.type or "?", 
-    parsed.src and parsed.src:sub(1, 12) or "?",
-    parsed.dst and parsed.dst:sub(1, 12) or "?"))
-  logDebug(string.format("  SEQ: %d | UID: %s | TTL: %d", 
-    parsed.seq or 0, 
-    parsed.uid and parsed.uid:sub(1, 8) or "?",
-    parsed.ttl or 0))
-  
-  if type(parsed.payload) == "table" then
-    logDebug("  Payload: {")
-    for k, v in pairs(parsed.payload) do
-      logDebug(string.format("    %s = %s", tostring(k), tostring(v)))
-    end
-    logDebug("  }")
-  elseif parsed.payload and parsed.payload ~= "" then
-    local preview = tostring(parsed.payload):sub(1, 60)
-    if #tostring(parsed.payload) > 60 then preview = preview .. "..." end
-    logDebug("  Payload: " .. preview)
-  end
-end
-
--- === ОСНОВНОЙ КОД РОУТЕРА ===
-
+-- === СТРУКТУРЫ ДАННЫХ ===
 local config = {}
 local leases = {}
+
+-- NAT таблицы (PAT - Port Address Translation)
+-- nat_out: ключ = "InternalIP:InternalPort" -> значение = AllocatedExternalPort
+-- nat_in:  ключ = AllocatedExternalPort -> значение = {ip, port, mac, ts}
+local nat_out = {}
+local nat_in = {}
+local nextNatPort = Router.NAT_PORT_MIN
+
 local seenCache = nil
 local modem = nil
 local packetCounter = 0
+
+-- === ФУНКЦИИ КОНФИГУРАЦИИ ===
 
 function Router.loadConfig()
   config = Utils.loadConfig(Router.CONFIG_PATH)
@@ -172,6 +130,147 @@ function Router.getMACByIP(ip)
   return nil
 end
 
+-- === NAT ФУНКЦИИ (PAT) ===
+
+-- Аллокация внешнего порта
+local function allocateExternalPort()
+  local startPort = nextNatPort
+  
+  repeat
+    if not nat_in[nextNatPort] then
+      local port = nextNatPort
+      nextNatPort = nextNatPort + 1
+      if nextNatPort > Router.NAT_PORT_MAX then
+        nextNatPort = Router.NAT_PORT_MIN
+      end
+      return port
+    end
+    
+    nextNatPort = nextNatPort + 1
+    if nextNatPort > Router.NAT_PORT_MAX then
+      nextNatPort = Router.NAT_PORT_MIN
+    end
+  until nextNatPort == startPort
+  
+  return nil  -- Все порты заняты
+end
+
+-- Очистка устаревших NAT записей
+function Router.cleanupNAT()
+  local now = computer.uptime()
+  local removed = 0
+  
+  for extPort, entry in pairs(nat_in) do
+    if now - entry.ts > Router.NAT_TIMEOUT then
+      -- Удаляем обратную запись
+      local outKey = entry.ip .. ":" .. tostring(entry.port)
+      nat_out[outKey] = nil
+      nat_in[extPort] = nil
+      removed = removed + 1
+    end
+  end
+  
+  if removed > 0 then
+    logNAT(string.format("Cleaned up %d stale NAT entries", removed))
+  end
+  
+  return removed
+end
+
+-- === ИСХОДЯЩИЙ NAT ===
+-- Модифицирует parsed in-place, возвращает true/false
+function Router.processNAT_Out(parsed, senderMAC)
+  if not config.external_ip or config.external_ip == "" then
+    logWarning("NAT OUT: No external IP configured")
+    return false
+  end
+  
+  -- Безопасно получаем порт из payload
+  local internalPort = 0
+  if parsed.isPayloadTable and type(parsed.payload) == "table" then
+    internalPort = parsed.payload.app_port or 0
+  end
+  
+  local natKey = parsed.src .. ":" .. tostring(internalPort)
+  local externalPort = nat_out[natKey]
+  
+  -- Если маппинга нет - создаем
+  if not externalPort then
+    externalPort = allocateExternalPort()
+    if not externalPort then
+      logError("NAT OUT: Port pool exhausted!")
+      return false
+    end
+    
+    -- Записываем в обе таблицы
+    nat_out[natKey] = externalPort
+    nat_in[externalPort] = {
+      ip = parsed.src,
+      port = internalPort,
+      mac = senderMAC,
+      ts = computer.uptime()
+    }
+    
+    logNAT(string.format("NEW: %s:%d -> %s:%d", 
+      parsed.src, internalPort, config.external_ip, externalPort))
+  else
+    -- Обновляем timestamp
+    nat_in[externalPort].ts = computer.uptime()
+  end
+  
+  -- Подменяем SRC на внешний IP
+  parsed.src = config.external_ip
+  
+  -- Подменяем порт в payload (если есть)
+  if parsed.isPayloadTable and type(parsed.payload) == "table" then
+    parsed.payload.app_port = externalPort
+    -- Сохраняем оригинальный порт для отладки
+    parsed.payload._nat_original_port = internalPort
+  end
+  
+  return true
+end
+
+-- === ВХОДЯЩИЙ NAT ===
+-- Модифицирует parsed in-place, возвращает true/false
+function Router.processNAT_In(parsed)
+  -- Проверяем что пакет адресован нашему external_ip
+  if parsed.dst ~= config.external_ip then
+    return false, "not_our_ip"
+  end
+  
+  -- Получаем порт назначения
+  local destPort = 0
+  if parsed.isPayloadTable and type(parsed.payload) == "table" then
+    destPort = parsed.payload.app_port or 0
+  end
+  
+  -- Ищем маппинг
+  local natEntry = nat_in[destPort]
+  if not natEntry then
+    logWarning(string.format("NAT IN: No mapping for port %d", destPort))
+    return false, "no_mapping"
+  end
+  
+  logNAT(string.format("IN: %s:%d -> %s:%d", 
+    config.external_ip, destPort, natEntry.ip, natEntry.port))
+  
+  -- Подменяем DST на внутренний IP
+  parsed.dst = natEntry.ip
+  
+  -- Подменяем порт обратно
+  if parsed.isPayloadTable and type(parsed.payload) == "table" then
+    parsed.payload.app_port = natEntry.port
+  end
+  
+  -- Обновляем timestamp
+  natEntry.ts = computer.uptime()
+  
+  return true
+end
+
+-- === DHCP ОБРАБОТЧИКИ ===
+
 function Router.handleDHCPHello(senderMAC, senderIP)
   if leases[senderMAC] then
     local existingIP = leases[senderMAC].ip
@@ -210,19 +309,6 @@ function Router.handleDHCPHello(senderMAC, senderIP)
   end
 
   leases[senderMAC] = DHCP.createLease(senderMAC, newIP, tonumber(config.lease_timeout))
-
-  -- ОТЛАДКА
-  logDebug("=== LEASE DEBUG ===")
-  logDebug("  MAC: " .. tostring(senderMAC))
-  logDebug("  IP: " .. tostring(newIP))
-  if leases[senderMAC] then
-    logDebug("  Lease.ip: " .. tostring(leases[senderMAC].ip))
-    logDebug("  Lease.ts: " .. tostring(leases[senderMAC].ts))
-    logDebug("  Lease.leaseTime: " .. tostring(leases[senderMAC].leaseTime))
-  else
-    logError("LEASE IS NIL!")
-  end
-
   Router.saveLeases()
 
   logDHCP(string.format("HELLO from %s -> Allocated NEW IP: %s", 
@@ -251,6 +337,8 @@ function Router.handleDHCPRelease(senderMAC, senderIP)
   end
 end
 
+-- === HUB ФУНКЦИИ ===
+
 function Router.registerWithHub()
   if config.hub_enabled ~= "true" or not config.hub_address or config.hub_address == "" then
     return
@@ -264,14 +352,13 @@ function Router.registerWithHub()
     OCNP.TYPE.DATA,
     {
       type = Router.HUB.HELLO,
-      router_ip = config.router_ip,       
-      external_ip = config.external_ip    
+      router_ip = config.router_ip
     },
     0
   )
 
   modem.send(config.hub_address, Router.HUB_PORT, packet)
-  logHub("Registration packet sent")
+  logHub("Registration packet sent (local IP: " .. config.router_ip .. ")")
 end
 
 function Router.handleHubACK(payload)
@@ -290,134 +377,215 @@ function Router.handleHubACK(payload)
   end
 end
 
-function Router.routePacket(packet, senderMAC)
-  -- === ПРОВЕРКА 1: Игнорируем свои собственные пакеты ===
+-- === ГЛАВНАЯ ФУНКЦИЯ МАРШРУТИЗАЦИИ ===
+
+function Router.routePacket(rawPacket, senderMAC)
+  -- Игнорируем свои пакеты
   if senderMAC == config.interface then
-    logDebug("Ignoring own packet from " .. senderMAC:sub(1, 8))
     return
   end
 
-  -- === ПРОВЕРКА 2: Парсинг пакета ===
-  local parsed, err = OCNP.parsePacket(packet)
+  -- ШАГ 1: Парсим пакет
+  local parsed, err = OCNP.parsePacket(rawPacket)
   if not parsed then
     logError("Invalid packet dropped: " .. (err or "unknown"))
-    logDebug("  From MAC: " .. senderMAC:sub(1, 8))
-    logDebug("  Packet length: " .. #packet)
-    logDebug("  First 100 chars: " .. packet:sub(1, 100))
     return
   end
 
-  -- === ПРОВЕРКА 3: Версия протокола ===
+  -- ШАГ 2: Проверка версии
   if parsed.version ~= OCNP.VERSION then
     logWarning(string.format("Wrong protocol version: %s (expected %s)", 
       parsed.version, OCNP.VERSION))
     return
   end
 
-  -- -- === ПРОВЕРКА 4: Дубликаты (UID Cache) ===
-  -- if seenCache:has(parsed.uid) then
-  --   logDebug("Duplicate packet ignored (UID: " .. parsed.uid:sub(1, 8) .. ")")
-  --   return
-  -- end
-
+  -- ШАГ 3: Проверка дубликатов
+  if seenCache:has(parsed.uid) then
+    logDebug("Duplicate packet ignored (UID: " .. parsed.uid:sub(1, 8) .. ")")
+    return
+  end
   seenCache:set(parsed.uid, {ts = computer.uptime()})
 
-  -- === ЛОГИРОВАНИЕ ВХОДЯЩЕГО ПАКЕТА ===
-  logPacketContent(parsed, true)
-
-  -- === ОБРАБОТКА DHCP ===
-  if parsed.type == OCNP.TYPE.DATA and type(parsed.payload) == "table" then
-    if parsed.payload.type == DHCP.MSG.HELLO then
+  -- ШАГ 4: Обработка служебных сообщений (DHCP, HUB)
+  if parsed.isPayloadTable and type(parsed.payload) == "table" then
+    local ptype = parsed.payload.type
+    
+    if ptype == DHCP.MSG.HELLO then
       Router.handleDHCPHello(senderMAC, parsed.src)
       return
-    elseif parsed.payload.type == DHCP.MSG.RELEASE then
+    elseif ptype == DHCP.MSG.RELEASE then
       Router.handleDHCPRelease(senderMAC, parsed.src)
       return
-    elseif parsed.payload.type == Router.HUB.ACK or parsed.payload.type == Router.HUB.NAK then
+    elseif ptype == Router.HUB.ACK or ptype == Router.HUB.NAK then
       Router.handleHubACK(parsed.payload)
       return
     end
   end
 
-  -- === ПРОВЕРКА 5: TTL ===
+  -- ШАГ 5: Проверка TTL
   if parsed.ttl <= 0 then
     logWarning(string.format("TTL EXPIRED: %s -> %s (dropped)", 
       parsed.src, parsed.dst))
-
-    local errorPkt = OCNP.createError(
-      config.router_ip,
-      parsed.src,
-      "TTL_EXPIRED",
-      "TTL reached zero",
-      {original_uid = parsed.uid}
-    )
-    modem.broadcast(Router.PORT, errorPkt)
     return
   end
 
-  -- === МАРШРУТИЗАЦИЯ ===
-  if Router.isLocalIP(parsed.dst) then
-    -- Локальная маршрутизация
+  -- ШАГ 6: Определяем направление
+  local srcIsLocal = Router.isLocalIP(parsed.src)
+  local dstIsLocal = Router.isLocalIP(parsed.dst)
+  local dstIsOurExternal = (parsed.dst == config.external_ip)
+
+  -- === ЛОКАЛЬНАЯ МАРШРУТИЗАЦИЯ ===
+  if srcIsLocal and dstIsLocal then
     local targetMAC = Router.getMACByIP(parsed.dst)
+    
     if not targetMAC then
-      logWarning(string.format("ROUTE %s -> %s: Destination UNKNOWN", 
+      logWarning(string.format("LOCAL: %s -> %s: Destination unknown", 
         parsed.src, parsed.dst))
       return
     end
-
+    
     if targetMAC == senderMAC then
       logDebug("Packet from sender to itself, ignoring")
       return
     end
-
-    logRoute(string.format("LOCAL: %s -> %s via MAC %s", 
+    
+    -- Декремент TTL (in-place)
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
+      logWarning("TTL decrement failed: " .. (err or "unknown"))
+      return
+    end
+    
+    -- Сериализуем и отправляем
+    local finalPacket = OCNP.serialize(parsed)
+    modem.send(targetMAC, Router.PORT, finalPacket)
+    
+    logRoute(string.format("LOCAL: %s -> %s via %s", 
       parsed.src, parsed.dst, targetMAC:sub(1, 8)))
+    return
+  end
 
-    local newPacket, err = OCNP.decrementTTL(parsed)
-    if not newPacket then
-      logError("Failed to decrement TTL: " .. (err or "unknown"))
+  -- === ИСХОДЯЩИЙ (Local -> External) ===
+  if srcIsLocal and not dstIsLocal then
+    if config.hub_enabled ~= "true" or not config.hub_address or config.hub_address == "" then
+      logWarning("Cannot route external packet: Hub disabled")
       return
     end
-
-    modem.send(targetMAC, Router.PORT, newPacket)
-    logSuccess(string.format("Forwarded to %s (TTL: %d -> %d)", 
-      targetMAC:sub(1, 8), parsed.ttl, parsed.ttl - 1))
-  else
-    -- Внешняя маршрутизация через Hub
-    if config.hub_enabled ~= "true" then
-      logWarning(string.format("ROUTE %s -> %s: Hub DISABLED, dropped", 
-        parsed.src, parsed.dst))
+    
+    -- Применяем NAT
+    local natOK = Router.processNAT_Out(parsed, senderMAC)
+    if not natOK then
+      logError("NAT OUT failed")
       return
     end
-
-    if not config.hub_address or config.hub_address == "" then
-      logWarning(string.format("ROUTE %s -> %s: No Hub connection, dropped", 
-        parsed.src, parsed.dst))
+    
+    -- Декремент TTL
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
+      logWarning("TTL decrement failed: " .. (err or "unknown"))
       return
     end
-
-    logRoute(string.format("EXTERNAL: %s -> %s via HUB", 
+    
+    -- Сериализуем и отправляем на hub
+    local finalPacket = OCNP.serialize(parsed)
+    modem.send(config.hub_address, Router.HUB_PORT, finalPacket)
+    
+    logRoute(string.format("OUT: %s -> %s via HUB (NAT)", 
       parsed.src, parsed.dst))
+    return
+  end
 
-    local newPacket, err = OCNP.decrementTTL(parsed)
-    if not newPacket then
-      logError("Failed to decrement TTL: " .. (err or "unknown"))
+  -- === ВХОДЯЩИЙ (External -> Local) ===
+  if not srcIsLocal and dstIsLocal then
+    local targetMAC = Router.getMACByIP(parsed.dst)
+    
+    if not targetMAC then
+      logWarning(string.format("IN: %s -> %s: Local destination unknown", 
+        parsed.src, parsed.dst))
       return
     end
+    
+    -- Декремент TTL
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
+      logWarning("TTL decrement failed: " .. (err or "unknown"))
+      return
+    end
+    
+    -- Сериализуем и отправляем
+    local finalPacket = OCNP.serialize(parsed)
+    modem.send(targetMAC, Router.PORT, finalPacket)
+    
+    logRoute(string.format("IN: %s -> %s via %s", 
+      parsed.src, parsed.dst, targetMAC:sub(1, 8)))
+    return
+  end
 
-    modem.send(config.hub_address, Router.HUB_PORT, newPacket)
-    logSuccess(string.format("Forwarded to HUB (TTL: %d -> %d)", 
-      parsed.ttl, parsed.ttl - 1))
+  -- === ВХОДЯЩИЙ НА НАШ EXTERNAL IP (нужен обратный NAT) ===
+  if not srcIsLocal and dstIsOurExternal then
+    local natOK, natErr = Router.processNAT_In(parsed)
+    if not natOK then
+      if natErr ~= "not_our_ip" then
+        logWarning("NAT IN failed: " .. (natErr or "unknown"))
+      end
+      return
+    end
+    
+    -- После NAT dst изменился на локальный IP
+    local targetMAC = Router.getMACByIP(parsed.dst)
+    if not targetMAC then
+      logWarning(string.format("NAT IN: %s not found after NAT", parsed.dst))
+      return
+    end
+    
+    -- Декремент TTL
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
+      logWarning("TTL decrement failed: " .. (err or "unknown"))
+      return
+    end
+    
+    -- Сериализуем и отправляем
+    local finalPacket = OCNP.serialize(parsed)
+    modem.send(targetMAC, Router.PORT, finalPacket)
+    
+    logRoute(string.format("NAT IN: %s -> %s via %s", 
+      parsed.src, parsed.dst, targetMAC:sub(1, 8)))
+    return
+  end
+
+  -- === ТРАНЗИТ (External -> External, но не наш IP) ===
+  if not srcIsLocal and not dstIsLocal and not dstIsOurExternal then
+    if config.hub_enabled ~= "true" then
+      logWarning("Transit packet dropped: Hub disabled")
+      return
+    end
+    
+    -- Декремент TTL
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
+      logWarning("TTL decrement failed: " .. (err or "unknown"))
+      return
+    end
+    
+    -- Сериализуем и отправляем на hub
+    local finalPacket = OCNP.serialize(parsed)
+    modem.send(config.hub_address, Router.HUB_PORT, finalPacket)
+    
+    logRoute(string.format("TRANSIT: %s -> %s via HUB", 
+      parsed.src, parsed.dst))
+    return
   end
 end
+
+-- === ЗАПУСК ===
 
 function Router.start()
   term.clear()
   
-  -- === ЗАГОЛОВОК ===
   gpu.setForeground(0x00FFFF)
   print("╔════════════════════════════════════════╗")
-  print("║     PetusRouter v" .. Router.VERSION .. " - Enhanced    ║")
+  print("║   PetusRouter v" .. Router.VERSION .. " - NAT Ready    ║")
   print("╚════════════════════════════════════════╝")
   gpu.setForeground(0xFFFFFF)
   print("")
@@ -429,7 +597,6 @@ function Router.start()
 
   seenCache = Utils.LRUCache.new(2000)
 
-  -- === КОНФИГУРАЦИЯ ===
   logInfo("Configuration:")
   logInfo("  Interface: " .. config.interface:sub(1, 16) .. "...")
   logInfo("  Router IP: " .. config.router_ip)
@@ -443,18 +610,16 @@ function Router.start()
     end
     if config.external_ip and config.external_ip ~= "" then
       logHub("  External IP: " .. config.external_ip)
+    else
+      logHub("  External IP: will be assigned by ISP")
     end
   else
     logInfo("Hub Status: DISABLED")
   end
 
-  local leaseCount = 0
-  for _ in pairs(leases) do
-    leaseCount = leaseCount + 1
-  end
+  local leaseCount = Utils.tableSize(leases)
   logInfo("Active Leases: " .. leaseCount)
 
-  -- === ИНИЦИАЛИЗАЦИЯ МОДЕМА ===
   modem = component.proxy(config.interface)
   if not modem then
     logError("FATAL: Interface not found!")
@@ -468,7 +633,7 @@ function Router.start()
   
   print("")
   gpu.setForeground(0x00FF00)
-  print("✓ Router is READY and ONLINE!")
+  print("✓ Router is READY!")
   gpu.setForeground(0xFFFFFF)
   print("═══════════════════════════════════════════")
   print("")
@@ -477,9 +642,10 @@ function Router.start()
     Router.registerWithHub()
   end
 
-  -- === ГЛАВНЫЙ ЦИКЛ ===
+  -- Главный цикл
   while true do
-    local eventData = {event.pull("modem_message")}
+    local eventData = {event.pull(1, "modem_message")}
+    
     if eventData[1] == "modem_message" then
       local localAddress = eventData[2]
       local remoteAddress = eventData[3]
@@ -491,9 +657,10 @@ function Router.start()
 
       -- Периодическая очистка
       if packetCounter % Router.CLEANUP_INTERVAL == 0 then
-        logDebug("Running cleanup (cache + expired leases)...")
+        logDebug("Running cleanup...")
         seenCache:cleanup(Router.SEEN_TTL)
         DHCP.cleanupExpiredLeases(leases, tonumber(config.lease_timeout))
+        Router.cleanupNAT()
       end
 
       if port == Router.PORT or port == Router.HUB_PORT then
