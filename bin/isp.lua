@@ -1,4 +1,3 @@
--- ISP (fixed)
 local component = require("component")
 local event = require("event")
 local computer = require("computer")
@@ -10,7 +9,7 @@ local DHCP = require("dhcp")
 local BGP = require("bgp")
 
 local ISP = {}
-ISP.VERSION = "1.1"
+ISP.VERSION = "1.2"
 ISP.HUB_PORT = 32
 ISP.IX_PORT = 33
 ISP.CONFIG_PATH = "/etc/PetusISP/isp.conf"
@@ -23,7 +22,8 @@ ISP.HEARTBEAT_INTERVAL = 30
 
 local config = {}
 local routingTable = {}
-local clients = {}
+local clients = {}        -- MAC -> {ip, ts}
+local clientsByIP = {}    -- IP -> MAC (кэш для быстрого поиска)
 local seenCache = nil
 local modem = nil
 local packetCounter = 0
@@ -144,12 +144,13 @@ function ISP.announceOwnSubnets()
         orsSeq
       )
 
+      -- ИСПРАВЛЕНО: правильные вызовы modem.send
       for _, peer in ipairs(peers) do
-        modem.send(peer, config.interface, ISP.HUB_PORT, packet)
+        modem.send(peer, ISP.HUB_PORT, packet)
       end
 
       for _, ix in ipairs(ixNodes) do
-        modem.send(ix, config.interface, ISP.IX_PORT, packet)
+        modem.send(ix, ISP.IX_PORT, packet)
       end
 
       Utils.log("ISP", string.format("Announced %s/%s to peers/IX", subnet, maskStr))
@@ -181,14 +182,28 @@ function ISP.handleORS(parsed)
   end
 end
 
+-- Регистрация клиента с обновлением кэша
 function ISP.registerClient(clientMAC, clientIP)
+  -- Удаляем старый IP из кэша если был
+  if clients[clientMAC] and clients[clientMAC].ip then
+    clientsByIP[clients[clientMAC].ip] = nil
+  end
+  
   clients[clientMAC] = {
     ip = clientIP,
     ts = computer.uptime()
   }
+  
+  -- Добавляем в кэш по IP
+  clientsByIP[clientIP] = clientMAC
 
   Utils.log("ISP", string.format("Client registered: %s -> %s",
     clientMAC:sub(1, 8), clientIP))
+end
+
+-- Быстрый поиск MAC по IP через кэш
+function ISP.getMACByIP(ip)
+  return clientsByIP[ip]
 end
 
 function ISP.handleRouterHello(parsed, senderMAC)
@@ -196,12 +211,16 @@ function ISP.handleRouterHello(parsed, senderMAC)
     return
   end
 
+  -- ИСПРАВЛЕНО: безопасная проверка payload
+  if not parsed.isPayloadTable or type(parsed.payload) ~= "table" then
+    return
+  end
+  
   local payload = parsed.payload
-  if type(payload) ~= "table" or payload.type ~= "HUB_ROUTER_HELLO" then
+  if payload.type ~= "HUB_ROUTER_HELLO" then
     return
   end
 
-  -- prefer external_ip if router provided it; fallback to router_ip
   local routerIP = payload.external_ip or payload.router_ip
   if not routerIP or routerIP == "" then
     Utils.log("ISP", string.format("Router hello from %s missing ip fields", senderMAC:sub(1,8)))
@@ -211,7 +230,6 @@ function ISP.handleRouterHello(parsed, senderMAC)
   if ISP.isOwnSubnet(routerIP) then
     ISP.registerClient(senderMAC, routerIP)
 
-    -- reply with standard HUB ACK
     local ack = OCNP.createPacket(
       config.external_ip,
       senderMAC,
@@ -219,9 +237,11 @@ function ISP.handleRouterHello(parsed, senderMAC)
       {type = "HUB_ROUTER_ACK", ip = config.external_ip},
       0
     )
-    modem.send(senderMAC, config.interface, ISP.HUB_PORT, ack)
+    -- ИСПРАВЛЕНО: правильный вызов modem.send
+    modem.send(senderMAC, ISP.HUB_PORT, ack)
 
-    Utils.log("ISP", string.format("Router hello ACK sent to %s (registered %s)", senderMAC:sub(1, 8), routerIP))
+    Utils.log("ISP", string.format("Router hello ACK sent to %s (registered %s)", 
+      senderMAC:sub(1, 8), routerIP))
   else
     local nak = OCNP.createPacket(
       config.external_ip,
@@ -230,42 +250,49 @@ function ISP.handleRouterHello(parsed, senderMAC)
       {type = "HUB_ROUTER_NAK", reason = "Not in our subnet"},
       0
     )
-    modem.send(senderMAC, config.interface, ISP.HUB_PORT, nak)
+    -- ИСПРАВЛЕНО: правильный вызов modem.send
+    modem.send(senderMAC, ISP.HUB_PORT, nak)
 
-    Utils.log("ISP", string.format("Router hello NAK sent to %s (wrong subnet: %s)", senderMAC:sub(1, 8), routerIP))
+    Utils.log("ISP", string.format("Router hello NAK sent to %s (wrong subnet: %s)", 
+      senderMAC:sub(1, 8), routerIP))
   end
 end
 
-function ISP.routePacket(packet, senderMAC, port)
-  local parsed, err = OCNP.parsePacket(packet)
+function ISP.routePacket(rawPacket, senderMAC, port)
+  -- ШАГ 1: Парсим пакет
+  local parsed, err = OCNP.parsePacket(rawPacket)
   if not parsed then
     Utils.log("ISP", "Invalid packet dropped: " .. (err or "unknown"))
     return
   end
 
-  if parsed.version ~= ISP.VERSION then
+  -- ИСПРАВЛЕНО: проверяем версию OCNP, не ISP
+  if parsed.version ~= OCNP.VERSION then
     Utils.log("ISP", "Unknown packet version, dropped")
     return
   end
 
+  -- ШАГ 2: Дедупликация
   if seenCache:has(parsed.uid) then
     return
   end
-
   seenCache:set(parsed.uid, {ts = computer.uptime()})
 
+  -- ШАГ 3: Обработка ORS
   if parsed.type == OCNP.TYPE.ORS then
     ISP.handleORS(parsed)
     return
   end
 
-  if parsed.type == OCNP.TYPE.DATA and type(parsed.payload) == "table" then
+  -- ШАГ 4: Обработка служебных сообщений
+  if parsed.isPayloadTable and type(parsed.payload) == "table" then
     if parsed.payload.type == "HUB_ROUTER_HELLO" then
       ISP.handleRouterHello(parsed, senderMAC)
       return
     end
   end
 
+  -- ШАГ 5: Проверка TTL
   if parsed.ttl <= 0 then
     Utils.log("ISP", string.format("TTL expired %s -> %s (dropped)",
       parsed.src, parsed.dst))
@@ -281,14 +308,10 @@ function ISP.routePacket(packet, senderMAC, port)
     return
   end
 
+  -- ШАГ 6: Маршрутизация
   if ISP.isOwnSubnet(parsed.dst) then
-    local targetMAC = nil
-    for mac, client in pairs(clients) do
-      if client.ip == parsed.dst then
-        targetMAC = mac
-        break
-      end
-    end
+    -- Локальная доставка
+    local targetMAC = ISP.getMACByIP(parsed.dst)
 
     if not targetMAC then
       Utils.log("ISP", string.format("ROUTE %s -> %s (client unknown)",
@@ -308,14 +331,19 @@ function ISP.routePacket(packet, senderMAC, port)
     Utils.log("ISP", string.format("ROUTE %s -> %s via %s (local client)",
       parsed.src, parsed.dst, targetMAC:sub(1, 8)))
 
-    local newPacket, err = OCNP.decrementTTL(parsed)
-    if not newPacket then
+    -- Декремент TTL (in-place)
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
       Utils.log("ISP", "Failed to decrement TTL: " .. (err or "unknown"))
       return
     end
 
-    modem.send(targetMAC, config.interface, ISP.HUB_PORT, newPacket)
+    -- Сериализуем и отправляем
+    local finalPacket = OCNP.serialize(parsed)
+    -- ИСПРАВЛЕНО: правильный вызов modem.send
+    modem.send(targetMAC, ISP.HUB_PORT, finalPacket)
   else
+    -- Внешняя маршрутизация через BGP
     local route = BGP.lookupRoute(parsed.dst, routingTable)
 
     if not route then
@@ -336,13 +364,16 @@ function ISP.routePacket(packet, senderMAC, port)
     Utils.log("ISP", string.format("ROUTE %s -> %s via %s (next hop)",
       parsed.src, parsed.dst, route.next_hop))
 
-    local newPacket, err = OCNP.decrementTTL(parsed)
-    if not newPacket then
+    -- Декремент TTL (in-place)
+    local result, err = OCNP.decrementTTL(parsed)
+    if not result then
       Utils.log("ISP", "Failed to decrement TTL: " .. (err or "unknown"))
       return
     end
 
-    modem.broadcast(ISP.HUB_PORT, newPacket)
+    -- Сериализуем и отправляем
+    local finalPacket = OCNP.serialize(parsed)
+    modem.broadcast(ISP.HUB_PORT, finalPacket)
   end
 end
 
@@ -363,7 +394,8 @@ function ISP.sendHeartbeat()
       "",
       0
     )
-    modem.send(peer, config.interface, ISP.HUB_PORT, ping)
+    -- ИСПРАВЛЕНО: правильный вызов modem.send
+    modem.send(peer, ISP.HUB_PORT, ping)
   end
 end
 
